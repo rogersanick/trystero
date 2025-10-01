@@ -5,16 +5,28 @@ const iceStateEvent = 'icegatheringstatechange'
 const offerType = 'offer'
 const answerType = 'answer'
 
-export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
-  const pc = new (rtcPolyfill || RTCPeerConnection)({
+export default (
+  initiator,
+  {rtcConfig, rtcPolyfill, turnConfig, trickle = true} = {}
+) => {
+  const RTCPeerConnectionCtor =
+    rtcPolyfill?.RTCPeerConnection || rtcPolyfill || RTCPeerConnection
+  const RTCIceCandidateCtor =
+    rtcPolyfill?.RTCIceCandidate ||
+    (typeof RTCIceCandidate === 'undefined' ? null : RTCIceCandidate)
+
+  const pc = new RTCPeerConnectionCtor({
     iceServers: defaultIceServers.concat(turnConfig || []),
     ...rtcConfig
   })
 
   const handlers = {}
+  const signalQueue = []
   let makingOffer = false
   let isSettingRemoteAnswerPending = false
   let dataChannel = null
+  let signalHandler = null
+  let offerResolver
 
   const setupDataChannel = channel => {
     channel.binaryType = 'arraybuffer'
@@ -25,7 +37,7 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
     channel.onerror = err => handlers.error?.(err)
   }
 
-  const waitForIceGathering = pc =>
+  const waitForIceGathering = (pc, stripTrickle) =>
     Promise.race([
       new Promise(res => {
         const checkState = () => {
@@ -41,8 +53,46 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
       new Promise(res => setTimeout(res, iceTimeout))
     ]).then(() => ({
       type: pc.localDescription.type,
-      sdp: pc.localDescription.sdp.replace(/a=ice-options:trickle\s\n/g, '')
+      sdp: stripTrickle
+        ? pc.localDescription.sdp.replace(/a=ice-options:trickle\s*(\r?\n)/g, '')
+        : pc.localDescription.sdp
     }))
+
+  const isTrickleSupported = () => trickle && pc.canTrickleIceCandidates !== false
+
+  const flushSignalQueue = () => {
+    if (!signalHandler) {
+      return
+    }
+
+    while (signalQueue.length) {
+      signalHandler(signalQueue.shift())
+    }
+  }
+
+  const emitSignal = signal => {
+    if (!signal) {
+      return
+    }
+
+    if (signal.type === offerType && offerResolver) {
+      offerResolver(signal)
+      offerResolver = null
+
+      if (!signalHandler) {
+        return
+      }
+    }
+
+    if (signalHandler) {
+      signalHandler(signal)
+      return
+    }
+
+    if ('candidate' in signal) {
+      signalQueue.push(signal)
+    }
+  }
 
   if (initiator) {
     dataChannel = pc.createDataChannel('data')
@@ -58,14 +108,41 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
     try {
       makingOffer = true
       await pc.setLocalDescription()
-      const offer = await waitForIceGathering(pc)
+      const localDescription = isTrickleSupported()
+        ? pc.localDescription
+        : await waitForIceGathering(pc, true)
 
-      handlers.signal?.(offer)
+      emitSignal(localDescription)
     } catch (err) {
       handlers.error?.(err)
     } finally {
       makingOffer = false
     }
+  }
+
+  const serializeCandidate = candidate => {
+    if (!candidate) {
+      return null
+    }
+
+    if (candidate.toJSON) {
+      return candidate.toJSON()
+    }
+
+    return {
+      candidate: candidate.candidate,
+      sdpMid: candidate.sdpMid,
+      sdpMLineIndex: candidate.sdpMLineIndex,
+      usernameFragment: candidate.usernameFragment
+    }
+  }
+
+  pc.onicecandidate = ({candidate}) => {
+    if (!isTrickleSupported()) {
+      return
+    }
+
+    emitSignal({candidate: serializeCandidate(candidate)})
   }
 
   pc.onconnectionstatechange = () => {
@@ -109,7 +186,30 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
       }
 
       try {
-        if (sdp.type === offerType) {
+        if ('candidate' in sdp) {
+          try {
+            if (!isTrickleSupported()) {
+              return
+            }
+
+            if (!sdp.candidate && sdp.candidate !== null) {
+              return
+            }
+
+            const candidateInit =
+              sdp.candidate === null
+                ? null
+                : RTCIceCandidateCtor
+                ? new RTCIceCandidateCtor(sdp.candidate)
+                : sdp.candidate
+
+            await pc.addIceCandidate(candidateInit)
+          } catch (err) {
+            handlers.error?.(err)
+          }
+
+          return
+        } else if (sdp.type === offerType) {
           if (
             makingOffer ||
             (pc.signalingState !== 'stable' && !isSettingRemoteAnswerPending)
@@ -127,8 +227,10 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
           }
 
           await pc.setLocalDescription()
-          const answer = await waitForIceGathering(pc)
-          handlers.signal?.(answer)
+          const answer = isTrickleSupported()
+            ? pc.localDescription
+            : await waitForIceGathering(pc, true)
+          emitSignal(answer)
 
           return answer
         } else if (sdp.type === answerType) {
@@ -153,16 +255,18 @@ export default (initiator, {rtcConfig, rtcPolyfill, turnConfig}) => {
       isSettingRemoteAnswerPending = false
     },
 
-    setHandlers: newHandlers => Object.assign(handlers, newHandlers),
+    setHandlers: newHandlers => {
+      if (newHandlers.signal) {
+        signalHandler = newHandlers.signal
+        flushSignalQueue()
+      }
+
+      Object.assign(handlers, newHandlers)
+    },
 
     offerPromise: initiator
       ? new Promise(
-          res =>
-            (handlers.signal = sdp => {
-              if (sdp.type === offerType) {
-                res(sdp)
-              }
-            })
+          res => (offerResolver = res)
         )
       : Promise.resolve(),
 

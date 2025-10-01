@@ -16,8 +16,10 @@ import {
 const poolSize = 20
 const announceIntervalMs = 5_333
 const offerTtl = 57_333
+const offerType = 'offer'
+const answerType = 'answer'
 
-export default ({init, subscribe, announce}) => {
+export default ({init, subscribe, announce, trickle = true}) => {
   const occupiedRooms = {}
 
   let didInit = false
@@ -39,15 +41,35 @@ export default ({init, subscribe, announce}) => {
     const selfTopicP = sha1(topicPath(rootTopicPlaintext, selfId))
     const key = genKey(config.password || '', appId, roomId)
 
-    const withKey = f => async signal => ({
+    const encryptDescription = async signal => ({
       type: signal.type,
-      sdp: await f(key, signal.sdp)
+      sdp: await encrypt(key, signal.sdp)
     })
 
-    const toPlain = withKey(decrypt)
-    const toCipher = withKey(encrypt)
+    const decryptDescription = async signal => ({
+      type: signal.type,
+      sdp: await decrypt(key, signal.sdp)
+    })
 
-    const makeOffer = () => initPeer(true, config)
+    const encryptCandidate = async candidate => {
+      if (candidate === null || candidate === undefined) {
+        return candidate
+      }
+
+      return encrypt(key, toJson(candidate))
+    }
+
+    const decryptCandidate = async candidate => {
+      if (candidate === null || candidate === undefined) {
+        return candidate
+      }
+
+      return fromJson(await decrypt(key, candidate))
+    }
+
+    const peerConfig = {...config, trickle: config.trickle ?? trickle}
+
+    const makeOffer = () => initPeer(true, peerConfig)
 
     const connectPeer = (peer, peerId, relayId) => {
       if (connectedPeers[peerId]) {
@@ -94,9 +116,27 @@ export default ({init, subscribe, announce}) => {
         offerPool
           .splice(0, n)
           .map(peer =>
-            peer.offerPromise.then(toCipher).then(offer => ({peer, offer}))
+            peer.offerPromise
+              .then(encryptDescription)
+              .then(offer => ({peer, offer}))
           )
       )
+    }
+
+    const formatSignal = async signal => {
+      if ('candidate' in signal) {
+        return {candidate: await encryptCandidate(signal.candidate)}
+      }
+
+      if (signal.type === offerType) {
+        return {offer: await encryptDescription(signal)}
+      }
+
+      if (signal.type === answerType) {
+        return {answer: await encryptDescription(signal)}
+      }
+
+      return null
     }
 
     const handleJoinError = (peerId, sdpType) =>
@@ -114,8 +154,34 @@ export default ({init, subscribe, announce}) => {
         return
       }
 
-      const {peerId, offer, answer, peer} =
-        typeof msg === 'string' ? fromJson(msg) : msg
+      const message = typeof msg === 'string' ? fromJson(msg) : msg
+      const {peerId, offer, answer, candidate, peer} = message
+
+      if (candidate !== undefined) {
+        if (peerId === selfId) {
+          return
+        }
+
+        let plainCandidate
+
+        try {
+          plainCandidate = await decryptCandidate(candidate)
+        } catch {
+          handleJoinError(peerId, 'candidate')
+          return
+        }
+
+        const targetPeer =
+          peer?.isDead === false
+            ? peer
+            : connectedPeers[peerId] || pendingOffers[peerId]?.[relayId]
+
+        if (targetPeer && !targetPeer.isDead) {
+          targetPeer.signal({candidate: plainCandidate})
+        }
+
+        return
+      }
 
       if (peerId === selfId || connectedPeers[peerId]) {
         return
@@ -126,25 +192,34 @@ export default ({init, subscribe, announce}) => {
           return
         }
 
-        const [[{peer, offer}], topic] = await all([
+        const [[{peer: pendingPeer, offer}], topic] = await all([
           getOffers(1),
           sha1(topicPath(rootTopicPlaintext, peerId))
         ])
 
         pendingOffers[peerId] ||= []
-        pendingOffers[peerId][relayId] = peer
+        pendingOffers[peerId][relayId] = pendingPeer
 
         setTimeout(
           () => prunePendingOffer(peerId, relayId),
           announceIntervals[relayId] * 0.9
         )
 
-        peer.setHandlers({
-          connect: () => connectPeer(peer, peerId, relayId),
-          close: () => disconnectPeer(peer, peerId)
-        })
-
         signalPeer(topic, toJson({peerId: selfId, offer}))
+
+        const sendSignal = async signal => {
+          const payload = await formatSignal(signal)
+
+          if (payload) {
+            signalPeer(topic, toJson({peerId: selfId, ...payload}))
+          }
+        }
+
+        pendingPeer.setHandlers({
+          signal: signal => sendSignal(signal),
+          connect: () => connectPeer(pendingPeer, peerId, relayId),
+          close: () => disconnectPeer(pendingPeer, peerId)
+        })
       } else if (offer) {
         const myOffer = pendingOffers[peerId]?.[relayId]
 
@@ -152,39 +227,43 @@ export default ({init, subscribe, announce}) => {
           return
         }
 
-        const peer = initPeer(false, config)
-        peer.setHandlers({
-          connect: () => connectPeer(peer, peerId, relayId),
-          close: () => disconnectPeer(peer, peerId)
-        })
+        const newPeer = initPeer(false, peerConfig)
 
         let plainOffer
 
         try {
-          plainOffer = await toPlain(offer)
+          plainOffer = await decryptDescription(offer)
         } catch {
           handleJoinError(peerId, 'offer')
           return
         }
 
-        if (peer.isDead) {
+        if (newPeer.isDead) {
           return
         }
 
-        const [topic, answer] = await all([
-          sha1(topicPath(rootTopicPlaintext, peerId)),
-          peer.signal(plainOffer)
-        ])
+        const topic = await sha1(topicPath(rootTopicPlaintext, peerId))
 
-        signalPeer(
-          topic,
-          toJson({peerId: selfId, answer: await toCipher(answer)})
-        )
+        const sendSignal = async signal => {
+          const payload = await formatSignal(signal)
+
+          if (payload) {
+            signalPeer(topic, toJson({peerId: selfId, ...payload}))
+          }
+        }
+
+        newPeer.setHandlers({
+          signal: signal => sendSignal(signal),
+          connect: () => connectPeer(newPeer, peerId, relayId),
+          close: () => disconnectPeer(newPeer, peerId)
+        })
+
+        await newPeer.signal(plainOffer)
       } else if (answer) {
         let plainAnswer
 
         try {
-          plainAnswer = await toPlain(answer)
+          plainAnswer = await decryptDescription(answer)
         } catch (e) {
           handleJoinError(peerId, 'answer')
           return

@@ -9,18 +9,20 @@ export default (
   initiator,
   {rtcConfig, rtcPolyfill, turnConfig, trickle = true} = {}
 ) => {
-  const RTCPeerConnectionCtor =
+  const RTCPeerConnectionConstructor =
     rtcPolyfill?.RTCPeerConnection || rtcPolyfill || RTCPeerConnection
-  const RTCIceCandidateCtor =
+  const RTCIceCandidateConstructor =
     rtcPolyfill?.RTCIceCandidate ||
     (typeof RTCIceCandidate === 'undefined' ? null : RTCIceCandidate)
 
-  const pc = new RTCPeerConnectionCtor({
+  const pc = new RTCPeerConnectionConstructor({
     iceServers: defaultIceServers.concat(turnConfig || []),
     ...rtcConfig
   })
 
   const handlers = {}
+  // Candidate events may fire before the strategy attaches a handler. We keep
+  // them in a FIFO buffer so the transport can flush them later.
   const signalQueue = []
   let makingOffer = false
   let isSettingRemoteAnswerPending = false
@@ -37,6 +39,9 @@ export default (
     channel.onerror = err => handlers.error?.(err)
   }
 
+  // In environments without trickle ICE support we wait for the initial
+  // gathering phase to finish and optionally remove the trickle attribute from
+  // the SDP before sending it across the wire.
   const waitForIceGathering = (pc, stripTrickle) =>
     Promise.race([
       new Promise(res => {
@@ -58,8 +63,12 @@ export default (
         : pc.localDescription.sdp
     }))
 
+  // Trickle ICE is enabled when it is allowed by the configuration and the
+  // current peer connection reports support for streaming candidates.
   const isTrickleSupported = () => trickle && pc.canTrickleIceCandidates !== false
 
+  // Candidate signals can arrive before the transport attaches a handler. We
+  // queue them until the handler is ready so early candidates are not lost.
   const flushSignalQueue = () => {
     if (!signalHandler) {
       return
@@ -70,6 +79,8 @@ export default (
     }
   }
 
+  // Signals are delivered immediately when a handler exists; otherwise we
+  // buffer candidate events until one attaches.
   const emitSignal = signal => {
     if (!signal) {
       return
@@ -104,6 +115,10 @@ export default (
     }
   }
 
+  // Negotiation either sends a partial SDP immediately (trickle) or waits for
+  // every candidate before proceeding (vanilla). This keeps both flows in
+  // parity with the previous behaviour while enabling faster setups when
+  // allowed.
   pc.onnegotiationneeded = async () => {
     try {
       makingOffer = true
@@ -120,6 +135,9 @@ export default (
     }
   }
 
+  // Convert RTCIceCandidate instances into plain objects so that they can be
+  // encrypted and relayed between peers. Browsers that already supply
+  // `toJSON` provide all of the necessary fields for the transport to work.
   const serializeCandidate = candidate => {
     if (!candidate) {
       return null
@@ -137,6 +155,9 @@ export default (
     }
   }
 
+  // When trickle ICE is active we forward each candidate as soon as the local
+  // peer discovers it. Browsers emit a final `null` candidate to signal the end
+  // of the stream which keeps remote peers aligned with the native API.
   pc.onicecandidate = ({candidate}) => {
     if (!isTrickleSupported()) {
       return
@@ -160,6 +181,8 @@ export default (
 
   if (initiator) {
     if (!pc.canTrickleIceCandidates) {
+      // Some browsers only surface support after the first local description,
+      // so we proactively trigger negotiation to populate the offer pool.
       pc.onnegotiationneeded()
     }
   }
@@ -177,6 +200,10 @@ export default (
       return pc.connectionState === 'closed'
     },
 
+    // The signaling entry point handles three scenarios:
+    //   1. Individual ICE candidates (trickle mode only)
+    //   2. Incoming offers, potentially rolling back glare
+    //   3. Incoming answers
     async signal(sdp) {
       if (
         dataChannel?.readyState === 'open' &&
@@ -189,6 +216,8 @@ export default (
         if ('candidate' in sdp) {
           try {
             if (!isTrickleSupported()) {
+              // Legacy peers do not expect incremental candidates so we drop
+              // them here and rely on the completed SDP exchange instead.
               return
             }
 
@@ -199,8 +228,8 @@ export default (
             const candidateInit =
               sdp.candidate === null
                 ? null
-                : RTCIceCandidateCtor
-                ? new RTCIceCandidateCtor(sdp.candidate)
+                : RTCIceCandidateConstructor
+                ? new RTCIceCandidateConstructor(sdp.candidate)
                 : sdp.candidate
 
             await pc.addIceCandidate(candidateInit)
@@ -210,6 +239,9 @@ export default (
 
           return
         } else if (sdp.type === offerType) {
+          // Trickle ICE peers handle glare by rolling back their local offer and
+          // accepting the remote one. Peers without trickle support follow the
+          // legacy flow and wait for all candidates before continuing.
           if (
             makingOffer ||
             (pc.signalingState !== 'stable' && !isSettingRemoteAnswerPending)

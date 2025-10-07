@@ -51,6 +51,8 @@ export default ({init, subscribe, announce, trickle = true}) => {
       sdp: await decrypt(key, signal.sdp)
     })
 
+    // Trickle candidates are serialized JSON payloads that we encrypt one by
+    // one before dispatching them through the signaling strategy.
     const encryptCandidate = async candidate => {
       if (candidate === null || candidate === undefined) {
         return candidate
@@ -59,6 +61,8 @@ export default ({init, subscribe, announce, trickle = true}) => {
       return encrypt(key, toJson(candidate))
     }
 
+    // Remote candidates are decrypted and converted back into objects that can
+    // be fed directly into the RTCPeerConnection API.
     const decryptCandidate = async candidate => {
       if (candidate === null || candidate === undefined) {
         return candidate
@@ -67,6 +71,9 @@ export default ({init, subscribe, announce, trickle = true}) => {
       return fromJson(await decrypt(key, candidate))
     }
 
+    // Every peer inherits the strategy's default trickle preference while
+    // allowing individual callers to override it. When trickle is disabled the
+    // peer automatically reverts to the legacy "vanilla" ICE flow.
     const peerConfig = {...config, trickle: config.trickle ?? trickle}
 
     const makeOffer = () => initPeer(true, peerConfig)
@@ -123,6 +130,8 @@ export default ({init, subscribe, announce, trickle = true}) => {
       )
     }
 
+    // All outgoing peer events are funneled through this helper so that offers,
+    // answers, and individual ICE candidates share the same encryption logic.
     const formatSignal = async signal => {
       if ('candidate' in signal) {
         return {candidate: await encryptCandidate(signal.candidate)}
@@ -177,6 +186,8 @@ export default ({init, subscribe, announce, trickle = true}) => {
             : connectedPeers[peerId] || pendingOffers[peerId]?.[relayId]
 
         if (targetPeer && !targetPeer.isDead) {
+          // Trickle ICE peers process every candidate as soon as it arrives,
+          // while peers that opted out simply ignore the candidate branch above.
           targetPeer.signal({candidate: plainCandidate})
         }
 

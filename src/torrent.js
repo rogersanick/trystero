@@ -171,6 +171,8 @@ export const joinRoom = strategy({
 
   announce: client => trackerAnnounceMs[client.url],
 
+  // Torrent trackers work best with the original non-trickle flow because they
+  // batch offers, so we keep the legacy behaviour by default.
   trickle: false
 })
 

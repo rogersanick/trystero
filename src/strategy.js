@@ -18,7 +18,9 @@ const poolSize = 20
 const announceIntervalMs = 5_333
 const offerTtl = 57_333
 
-export default ({init, subscribe, announce}) => {
+const candidateType = 'candidate'
+
+export default ({init, subscribe, announce, trickle = false}) => {
   const occupiedRooms = {}
 
   let didInit = false
@@ -29,27 +31,65 @@ export default ({init, subscribe, announce}) => {
 
   return (config, roomId, onJoinError) => {
     const {appId} = config
+    const effectiveConfig = {...config, trickle}
 
     if (occupiedRooms[appId]?.[roomId]) {
       return occupiedRooms[appId][roomId]
     }
 
     const pendingOffers = {}
+    const pendingAnswers = {}
     const connectedPeers = {}
+    const pendingCandidates = {}
     const rootTopicPlaintext = topicPath(libName, appId, roomId)
     const rootTopicP = sha1(rootTopicPlaintext)
     const selfTopicP = sha1(topicPath(rootTopicPlaintext, selfId))
     const key = genKey(config.password || '', appId, roomId)
 
-    const withKey = f => async signal => ({
-      type: signal.type,
-      sdp: await f(key, signal.sdp)
-    })
+    const toCipher = async signal => {
+      if (signal.type === candidateType) {
+        return {
+          type: candidateType,
+          candidate: await encrypt(key, toJson(signal.candidate))
+        }
+      }
+      return {
+        type: signal.type,
+        sdp: await encrypt(key, signal.sdp)
+      }
+    }
 
-    const toPlain = withKey(decrypt)
-    const toCipher = withKey(encrypt)
+    const toPlain = async encrypted => {
+      if (encrypted.type === candidateType) {
+        return {
+          type: candidateType,
+          candidate: fromJson(await decrypt(key, encrypted.candidate))
+        }
+      }
+      return {
+        type: encrypted.type,
+        sdp: await decrypt(key, encrypted.sdp)
+      }
+    }
 
-    const makeOffer = () => initPeer(true, config)
+    const makeOffer = () => initPeer(true, effectiveConfig)
+
+    const queueIncomingCandidate = (peerId, relayId, plainCandidate) => {
+      pendingCandidates[peerId] ||= []
+      ;(pendingCandidates[peerId][relayId] ||= []).push(plainCandidate)
+    }
+
+    const flushIncomingCandidates = (peerId, relayId, targetPeer) => {
+      const queued = pendingCandidates[peerId]?.[relayId]
+      if (!queued?.length || !targetPeer || targetPeer.isDead) return
+      delete pendingCandidates[peerId][relayId]
+      queued.forEach(c => targetPeer.signal(c))
+    }
+
+    const signalOutgoingCandidate = async (topic, signalPeer, envelope) => {
+      const candidate = await toCipher(envelope)
+      signalPeer(topic, toJson({peerId: selfId, candidate}))
+    }
 
     const connectPeer = (peer, peerId, relayId) => {
       if (connectedPeers[peerId]) {
@@ -62,9 +102,12 @@ export default ({init, subscribe, announce}) => {
       connectedPeers[peerId] = peer
       onPeerConnect(peer, peerId)
 
-      pendingOffers[peerId]?.forEach((peer, i) => {
+      if (pendingAnswers[peerId]?.[relayId] === peer) {
+        delete pendingAnswers[peerId][relayId]
+      }
+      pendingOffers[peerId]?.forEach((p, i) => {
         if (i !== relayId) {
-          peer.destroy()
+          p.destroy()
         }
       })
       delete pendingOffers[peerId]
@@ -116,10 +159,30 @@ export default ({init, subscribe, announce}) => {
         return
       }
 
-      const {peerId, offer, answer, peer} =
+      const {peerId, offer, answer, candidate, candidates, peer: msgPeer} =
         typeof msg === 'string' ? fromJson(msg) : msg
 
       if (peerId === selfId || connectedPeers[peerId]) {
+        return
+      }
+
+      if (candidate || candidates) {
+        const encryptedCandidates = candidate ? [candidate] : candidates
+        const plainCandidates = []
+        try {
+          plainCandidates.push(...(await all(encryptedCandidates.map(toPlain))))
+        } catch {
+          return
+        }
+        const targetPeer =
+          msgPeer ??
+          pendingOffers[peerId]?.[relayId] ??
+          pendingAnswers[peerId]?.[relayId]
+        if (targetPeer && !targetPeer.isDead) {
+          plainCandidates.forEach(c => targetPeer.signal(c))
+        } else {
+          plainCandidates.forEach(c => queueIncomingCandidate(peerId, relayId, c))
+        }
         return
       }
 
@@ -143,7 +206,12 @@ export default ({init, subscribe, announce}) => {
 
         peer.setHandlers({
           connect: () => connectPeer(peer, peerId, relayId),
-          close: () => disconnectPeer(peer, peerId)
+          close: () => disconnectPeer(peer, peerId),
+          signal: async envelope => {
+            if (envelope.type === candidateType) {
+              await signalOutgoingCandidate(topic, signalPeer, envelope)
+            }
+          }
         })
 
         signalPeer(topic, toJson({peerId: selfId, offer}))
@@ -154,11 +222,14 @@ export default ({init, subscribe, announce}) => {
           return
         }
 
-        const peer = initPeer(false, config)
+        const peer = initPeer(false, effectiveConfig)
         peer.setHandlers({
           connect: () => connectPeer(peer, peerId, relayId),
           close: () => disconnectPeer(peer, peerId)
         })
+
+        pendingAnswers[peerId] ||= []
+        pendingAnswers[peerId][relayId] = peer
 
         let plainOffer
 
@@ -178,6 +249,15 @@ export default ({init, subscribe, announce}) => {
           peer.signal(plainOffer)
         ])
 
+        peer.setHandlers({
+          signal: async envelope => {
+            if (envelope.type === candidateType) {
+              await signalOutgoingCandidate(topic, signalPeer, envelope)
+            }
+          }
+        })
+
+        flushIncomingCandidates(peerId, relayId, peer)
         signalPeer(
           topic,
           toJson({peerId: selfId, answer: await toCipher(answer)})
@@ -192,18 +272,20 @@ export default ({init, subscribe, announce}) => {
           return
         }
 
-        if (peer) {
-          peer.setHandlers({
-            connect: () => connectPeer(peer, peerId, relayId),
-            close: () => disconnectPeer(peer, peerId)
+        let targetPeer = msgPeer ?? pendingOffers[peerId]?.[relayId]
+
+        if (targetPeer) {
+          targetPeer.setHandlers({
+            connect: () => connectPeer(targetPeer, peerId, relayId),
+            close: () => disconnectPeer(targetPeer, peerId)
           })
-
-          peer.signal(plainAnswer)
+          await targetPeer.signal(plainAnswer)
+          flushIncomingCandidates(peerId, relayId, targetPeer)
         } else {
-          const peer = pendingOffers[peerId]?.[relayId]
-
-          if (peer && !peer.isDead) {
-            peer.signal(plainAnswer)
+          targetPeer = pendingAnswers[peerId]?.[relayId]
+          if (targetPeer && !targetPeer.isDead) {
+            await targetPeer.signal(plainAnswer)
+            flushIncomingCandidates(peerId, relayId, targetPeer)
           }
         }
       }

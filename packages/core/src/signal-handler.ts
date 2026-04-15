@@ -237,7 +237,7 @@ const scheduleOfferExpiry = (
   }, ttlMs)
 }
 
-const ensureOffer = (
+export const ensureOffer = (
   ctx: SignalContext,
   state: PeerState,
   peerId: string,
@@ -411,7 +411,7 @@ const handleAnnouncement = async (
   )
 }
 
-const handleOffer = async (
+export const handleOffer = async (
   ctx: SignalContext,
   relayId: number,
   peerId: string,
@@ -529,7 +529,7 @@ const handleOffer = async (
   await flushBufferedCandidates(state, answerPeer, offerId)
 }
 
-const handleCandidate = async (
+export const handleCandidate = async (
   ctx: SignalContext,
   peerId: string,
   candidate: string,
@@ -566,7 +566,7 @@ const handleCandidate = async (
   void targetPeer.signal(plainCandidate)
 }
 
-const handleAnswer = async (
+export const handleAnswer = async (
   ctx: SignalContext,
   relayId: number,
   peerId: string,

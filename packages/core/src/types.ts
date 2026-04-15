@@ -50,6 +50,15 @@ export type TurnServerConfig = {
   credentialType?: string
 }
 
+export type RoomStrategy = {
+  init: (
+    room: InternalRoom,
+    selfId: string,
+    config: BaseRoomConfig,
+    roomId: string
+  ) => void | (() => void)
+}
+
 export type BaseRoomConfig = {
   appId: string
   password?: string
@@ -57,6 +66,7 @@ export type BaseRoomConfig = {
   rtcConfig?: RTCConfiguration
   rtcPolyfill?: typeof RTCPeerConnection
   turnConfig?: TurnServerConfig[]
+  strategies?: RoomStrategy[]
   _test_only_mdnsHostFallbackToLoopback?: boolean
   _test_only_sharedPeerIdleMs?: number
 }
@@ -74,6 +84,8 @@ export type ProgressHandler = (
   peerId: string,
   metadata?: JsonValue
 ) => void
+
+export type PeerListener = (peerId: string) => void
 
 export type ActionSender<T extends DataPayload = DataPayload> = (
   data: T,
@@ -114,8 +126,8 @@ export type Room = {
     targetPeers?: TargetPeers,
     metadata?: JsonValue
   ) => Promise<void>[]
-  onPeerJoin: (fn: (peerId: string) => void) => void
-  onPeerLeave: (fn: (peerId: string) => void) => void
+  onPeerJoin: (fn: PeerListener) => void
+  onPeerLeave: (fn: PeerListener) => void
   onPeerStream: (
     fn: (stream: MediaStream, peerId: string, metadata?: JsonValue) => void
   ) => void
@@ -127,6 +139,12 @@ export type Room = {
       metadata?: JsonValue
     ) => void
   ) => void
+}
+
+export type InternalRoom = Room & {
+  _injectPeer: (peer: PeerHandle, peerId: string) => void
+  _addPeerJoinListener: (listenerId: string, fn: PeerListener) => void
+  _addPeerLeaveListener: (listenerId: string, fn: PeerListener) => void
 }
 
 export type SessionSignal = {

@@ -475,6 +475,7 @@ export default <
 
     occupiedRooms[appId] ??= {}
 
+    const strategyCleanups: Array<() => void> = []
     const appRoomRegistrations = getRoomRegistrations(appId)
     const joinedRoom = room(
       f => (onPeerConnect = f),
@@ -493,6 +494,7 @@ export default <
       () => {
         didLeaveRoom = true
         onPeerConnect = noOp
+        strategyCleanups.forEach(fn => fn())
 
         const registration = roomRegistrations[appId]?.[roomId]
 
@@ -588,6 +590,16 @@ export default <
 
       advertiseRoomPresenceToAll(appId, roomToken, true)
     })
+
+    if (config.strategies?.length) {
+      for (const strategy of config.strategies) {
+        const cleanup = strategy.init(joinedRoom, selfId, config, roomId)
+
+        if (cleanup) {
+          strategyCleanups.push(cleanup)
+        }
+      }
+    }
 
     return (occupiedRooms[appId][roomId] = joinedRoom)
   }

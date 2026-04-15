@@ -26,7 +26,9 @@ import type {
   HandshakePayload,
   HandshakeReceiver,
   HandshakeSender,
+  InternalRoom,
   JsonValue,
+  PeerListener,
   PeerHandle,
   PeerHandshake,
   Room,
@@ -51,6 +53,7 @@ const channelErrorEvent = 'error'
 const unloadEvent = 'beforeunload'
 const defaultHandshakeTimeoutMs = 10_000
 const backpressureWaitTimeoutMs = 10_000
+const defaultPeerListenerId = '@_user'
 const internalNs = (ns: string): string => '@_' + ns
 const beforeUnloadRoomCleanups = new Set<() => void>()
 
@@ -211,7 +214,7 @@ export default (
     onHandshakeError,
     handshakeTimeoutMs = defaultHandshakeTimeoutMs
   }: RoomOptions = {}
-): Room => {
+): InternalRoom => {
   const peerMap: Record<string, PeerHandle> = {}
   const activePeerMap: Record<string, PeerHandle> = {}
   const peerStates: Record<string, PendingPeerState> = {}
@@ -231,8 +234,8 @@ export default (
   const localStreamKeys = new WeakMap<MediaStream, string>()
   const localTrackKeys = new WeakMap<MediaStreamTrack, string>()
   const listeners = {
-    onPeerJoin: noOp as (peerId: string) => void,
-    onPeerLeave: noOp as (peerId: string) => void,
+    onPeerJoin: {} as Record<string, PeerListener>,
+    onPeerLeave: {} as Record<string, PeerListener>,
     onPeerStream: noOp as (
       stream: MediaStream,
       peerId: string,
@@ -301,6 +304,23 @@ export default (
 
   const getStreamKey = makeKeyGetter(localStreamKeys)
   const getTrackKey = makeKeyGetter(localTrackKeys)
+
+  const addPeerJoinListener = (listenerId: string, f: PeerListener): void => {
+    listeners.onPeerJoin[listenerId] = f
+    keys(activePeerMap).forEach(peerId => f(peerId))
+  }
+
+  const addPeerLeaveListener = (listenerId: string, f: PeerListener): void => {
+    listeners.onPeerLeave[listenerId] = f
+  }
+
+  const emitPeerJoin = (id: string): void => {
+    entries(listeners.onPeerJoin).forEach(([, listener]) => listener(id))
+  }
+
+  const emitPeerLeave = (id: string): void => {
+    entries(listeners.onPeerLeave).forEach(([, listener]) => listener(id))
+  }
 
   const getSharedMediaPeer = (id: string): SharedMediaPeer | null =>
     (peerMap[id] as SharedMediaPeer | undefined) ?? null
@@ -374,7 +394,7 @@ export default (
     current.destroy()
 
     if (wasActive) {
-      listeners.onPeerLeave(id)
+      emitPeerLeave(id)
     }
 
     onPeerLeave(id)
@@ -718,7 +738,7 @@ export default (
     state.isActive = true
     activePeerMap[id] = state.peer
     state.handshakeTimer = resetTimer(state.handshakeTimer)
-    listeners.onPeerJoin(id)
+    emitPeerJoin(id)
   }
 
   const failPeerHandshake = (
@@ -931,7 +951,7 @@ export default (
     maybeActivatePeer(id)
   })
 
-  onPeer((peer, id) => {
+  const registerPeer = (peer: PeerHandle, id: string): void => {
     const existingPeer = peerMap[id]
 
     if (existingPeer) {
@@ -997,7 +1017,9 @@ export default (
     })
 
     startPeerHandshake(id, peer)
-  })
+  }
+
+  onPeer(registerPeer)
 
   if (isBrowser) {
     unregisterBeforeUnloadCleanup = registerBeforeUnloadCleanup(() =>
@@ -1009,6 +1031,12 @@ export default (
     makeAction,
 
     leave,
+
+    _injectPeer: registerPeer,
+
+    _addPeerJoinListener: addPeerJoinListener,
+
+    _addPeerLeaveListener: addPeerLeaveListener,
 
     ping: async id => {
       if (!activePeerMap[id]) {
@@ -1086,12 +1114,9 @@ export default (
         peer.replaceTrack(oldTrack, newTrack)
       ),
 
-    onPeerJoin: f => {
-      listeners.onPeerJoin = f
-      keys(activePeerMap).forEach(peerId => f(peerId))
-    },
+    onPeerJoin: f => addPeerJoinListener(defaultPeerListenerId, f),
 
-    onPeerLeave: f => (listeners.onPeerLeave = f),
+    onPeerLeave: f => addPeerLeaveListener(defaultPeerListenerId, f),
 
     onPeerStream: f => (listeners.onPeerStream = f),
 
